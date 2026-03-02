@@ -15,8 +15,8 @@ import uvicorn
 
 # Environment variables (set these in Render)
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme123")  # Change this!
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME",)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD",)  # Change this!
 
 app = FastAPI()
 
