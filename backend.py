@@ -15,15 +15,15 @@ from contextlib import asynccontextmanager
 
 # Environment variables (set these in Render)
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")  # Default for testing
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")  # Default for testing
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
 app = FastAPI()
 
-# CORS - Allow all origins for development (you can restrict this later)
+# CORS - Updated to allow your frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pcfront.vercel.app"],  # Allow all origins for now
+    allow_origins=["https://pcfront.vercel.app", "http://localhost:3000"],  # Add your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,11 +38,13 @@ class ConnectionManager:
         self.active_web_clients: Dict[str, WebSocket] = {}  # client_id -> websocket
         self.agent_info: Dict[str, dict] = {}  # agent_id -> info
         self.command_queues: Dict[str, asyncio.Queue] = {}  # agent_id -> command queue
+        self.agent_clients: Dict[str, Set[str]] = {}  # agent_id -> set of client_ids watching
         
     async def connect_agent(self, agent_id: str, websocket: WebSocket, info: dict):
         self.active_agents[agent_id] = websocket
         self.agent_info[agent_id] = info
         self.command_queues[agent_id] = asyncio.Queue()
+        self.agent_clients[agent_id] = set()
         print(f"✅ Agent {agent_id} connected - {info.get('hostname', 'Unknown')}")
         
     def disconnect_agent(self, agent_id: str):
@@ -52,6 +54,8 @@ class ConnectionManager:
             del self.agent_info[agent_id]
         if agent_id in self.command_queues:
             del self.command_queues[agent_id]
+        if agent_id in self.agent_clients:
+            del self.agent_clients[agent_id]
         print(f"❌ Agent {agent_id} disconnected")
             
     async def connect_web_client(self, client_id: str, websocket: WebSocket):
@@ -61,7 +65,20 @@ class ConnectionManager:
     def disconnect_web_client(self, client_id: str):
         if client_id in self.active_web_clients:
             del self.active_web_clients[client_id]
+        
+        # Remove client from all agent watch lists
+        for agent_id in self.agent_clients:
+            self.agent_clients[agent_id].discard(client_id)
+            
         print(f"🌐 Web client {client_id} disconnected")
+    
+    def add_client_to_agent(self, agent_id: str, client_id: str):
+        if agent_id in self.agent_clients:
+            self.agent_clients[agent_id].add(client_id)
+            
+    def remove_client_from_agent(self, agent_id: str, client_id: str):
+        if agent_id in self.agent_clients:
+            self.agent_clients[agent_id].discard(client_id)
             
     def get_agents_list(self):
         return [{"id": agent_id, **info} for agent_id, info in self.agent_info.items()]
@@ -151,20 +168,22 @@ async def agent_websocket(websocket: WebSocket, agent_id: str):
                     try:
                         data = json.loads(message)
                         
-                        # Route responses to web clients
-                        if data.get("type") in ["command_output", "system_info", "process_list", "screen_frame"]:
+                        # Route responses to web clients watching this agent
+                        if data.get("type") in ["command_output", "system_info", "process_list", "screen_frame", "process_killed"]:
                             # Send to all web clients watching this agent
-                            for client_id, client_ws in list(manager.active_web_clients.items()):
-                                try:
-                                    await client_ws.send_text(json.dumps({
-                                        "type": "agent_response",
-                                        "agent_id": agent_id,
-                                        "data": data
-                                    }))
-                                except Exception as e:
-                                    print(f"⚠️ Error sending to web client {client_id}: {e}")
-                                    # Remove dead connections
-                                    manager.disconnect_web_client(client_id)
+                            if agent_id in manager.agent_clients:
+                                for client_id in manager.agent_clients[agent_id]:
+                                    if client_id in manager.active_web_clients:
+                                        try:
+                                            await manager.active_web_clients[client_id].send_text(json.dumps({
+                                                "type": "agent_response",
+                                                "agent_id": agent_id,
+                                                "data": data
+                                            }))
+                                        except Exception as e:
+                                            print(f"⚠️ Error sending to web client {client_id}: {e}")
+                                            # Remove dead connection
+                                            manager.disconnect_web_client(client_id)
                     except json.JSONDecodeError:
                         print(f"❌ Invalid JSON from agent {agent_id}")
                     except Exception as e:
@@ -228,6 +247,9 @@ async def client_websocket(websocket: WebSocket, client_id: str):
                 agent_id = data.get("agent_id")
                 if agent_id:
                     if agent_id in manager.active_agents:
+                        # Add this client to the agent's watch list
+                        manager.add_client_to_agent(agent_id, client_id)
+                        
                         command = {
                             "type": data.get("type"),
                             "data": data.get("data", {}),
@@ -246,6 +268,11 @@ async def client_websocket(websocket: WebSocket, client_id: str):
                                 "command": data.get("type")
                             }))
                             print(f"✅ Command queued for agent {agent_id}")
+                        else:
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "message": f"Agent {agent_id} command queue not found"
+                            }))
                     else:
                         await websocket.send_text(json.dumps({
                             "type": "error",
