@@ -1,331 +1,377 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+"""
+Remote PC Control - Complete Backend Server
+Handles WebSocket connections, agent management, and web interface
+"""
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import jwt
-import datetime
-import os
-import uuid
 import asyncio
-from typing import Dict, Optional, Set
 import json
+import os
+import time
+import uuid
+import logging
+from typing import Dict, Set, Optional, List, Any
+from datetime import datetime
 import secrets
-import platform
-from contextlib import asynccontextmanager
 
-# Environment variables (set these in Render)
-JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# Initialize FastAPI
+app = FastAPI(
+    title="Remote PC Control Server",
+    description="Control remote PCs via WebSocket",
+    version="1.0.0"
+)
 
-# CORS - Updated to allow your frontend
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pcfront.vercel.app", "http://localhost:3000"],  # Add your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-security = HTTPBearer(auto_error=False)
+# ==================== CONFIGURATION ====================
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
+API_KEY = os.getenv("API_KEY", secrets.token_urlsafe(16))
 
-# Store connected agents and web clients
-class ConnectionManager:
-    def __init__(self):
-        self.active_agents: Dict[str, WebSocket] = {}  # agent_id -> websocket
-        self.active_web_clients: Dict[str, WebSocket] = {}  # client_id -> websocket
-        self.agent_info: Dict[str, dict] = {}  # agent_id -> info
-        self.command_queues: Dict[str, asyncio.Queue] = {}  # agent_id -> command queue
-        self.agent_clients: Dict[str, Set[str]] = {}  # agent_id -> set of client_ids watching
-        
-    async def connect_agent(self, agent_id: str, websocket: WebSocket, info: dict):
-        self.active_agents[agent_id] = websocket
-        self.agent_info[agent_id] = info
-        self.command_queues[agent_id] = asyncio.Queue()
-        self.agent_clients[agent_id] = set()
-        print(f"✅ Agent {agent_id} connected - {info.get('hostname', 'Unknown')}")
-        
-    def disconnect_agent(self, agent_id: str):
-        if agent_id in self.active_agents:
-            del self.active_agents[agent_id]
-        if agent_id in self.agent_info:
-            del self.agent_info[agent_id]
-        if agent_id in self.command_queues:
-            del self.command_queues[agent_id]
-        if agent_id in self.agent_clients:
-            del self.agent_clients[agent_id]
-        print(f"❌ Agent {agent_id} disconnected")
-            
-    async def connect_web_client(self, client_id: str, websocket: WebSocket):
-        self.active_web_clients[client_id] = websocket
-        print(f"🌐 Web client {client_id} connected")
-        
-    def disconnect_web_client(self, client_id: str):
-        if client_id in self.active_web_clients:
-            del self.active_web_clients[client_id]
-        
-        # Remove client from all agent watch lists
-        for agent_id in self.agent_clients:
-            self.agent_clients[agent_id].discard(client_id)
-            
-        print(f"🌐 Web client {client_id} disconnected")
-    
-    def add_client_to_agent(self, agent_id: str, client_id: str):
-        if agent_id in self.agent_clients:
-            self.agent_clients[agent_id].add(client_id)
-            
-    def remove_client_from_agent(self, agent_id: str, client_id: str):
-        if agent_id in self.agent_clients:
-            self.agent_clients[agent_id].discard(client_id)
-            
-    def get_agents_list(self):
-        return [{"id": agent_id, **info} for agent_id, info in self.agent_info.items()]
+# ==================== DATA STORAGE ====================
+# Connected agents: agent_id -> websocket
+connected_agents: Dict[str, WebSocket] = {}
 
-manager = ConnectionManager()
+# Connected clients: client_id -> websocket
+connected_clients: Dict[str, WebSocket] = {}
 
-# Authentication
-def create_token(username: str):
-    payload = {
-        "sub": username,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+# Agent information cache: agent_id -> info
+agent_info: Dict[str, Dict] = {}
+
+# Active screen sharing sessions: agent_id -> bool
+active_screens: Set[str] = set()
+
+# Command queues: agent_id -> list of pending commands
+command_queues: Dict[str, List[Dict]] = {}
+
+# User sessions: token -> user_info
+user_sessions: Dict[str, Dict] = {}
+
+# Registered users: username -> user_data
+users: Dict[str, Dict] = {
+    ADMIN_USERNAME: {
+        "username": ADMIN_USERNAME,
+        "password": ADMIN_PASSWORD,  # Plain text (for demo)
+        "is_admin": True,
+        "created_at": datetime.now().isoformat()
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+}
 
-# Auth endpoints
+# ==================== MODELS ====================
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
+class LoginResponse(BaseModel):
+    success: bool
+    access_token: Optional[str]
+    is_admin: bool
+    message: str
 
-@app.post("/api/login", response_model=TokenResponse)
-async def login(request: LoginRequest):
-    print(f"Login attempt: {request.username}")
-    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
-        token = create_token(request.username)
-        print(f"✅ Login successful for {request.username}")
-        return {"access_token": token, "token_type": "bearer"}
-    print(f"❌ Login failed for {request.username}")
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+class CommandRequest(BaseModel):
+    agent_id: str
+    type: str
+    data: Dict[str, Any] = {}
 
-@app.get("/api/agents")
-async def get_agents(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
-        agents = manager.get_agents_list()
-        print(f"📋 Sending agents list: {len(agents)} agents")
-        return agents
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+# ==================== UTILITY FUNCTIONS ====================
+def create_session(username: str, is_admin: bool) -> str:
+    """Create a new user session"""
+    token = secrets.token_urlsafe(32)
+    user_sessions[token] = {
+        "username": username,
+        "is_admin": is_admin,
+        "created_at": time.time(),
+        "expires_at": time.time() + 86400  # 24 hours
+    }
+    return token
 
-@app.get("/api/agents/{agent_id}/status")
-async def get_agent_status(agent_id: str, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
-        if agent_id in manager.active_agents:
-            return {"status": "online", "info": manager.agent_info.get(agent_id, {})}
-        return {"status": "offline"}
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def verify_session(token: str) -> Optional[Dict]:
+    """Verify a session token"""
+    if token not in user_sessions:
+        return None
+    session = user_sessions[token]
+    if time.time() > session["expires_at"]:
+        del user_sessions[token]
+        return None
+    return session
 
-# Agent WebSocket (your home PC)
-@app.websocket("/ws/agent/{agent_id}")
-async def agent_websocket(websocket: WebSocket, agent_id: str):
-    # Accept the connection
-    await websocket.accept()
-    print(f"🔌 Agent {agent_id} attempting to connect...")
-    
-    try:
-        # Wait for agent info
-        try:
-            data = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-            agent_info = json.loads(data)
-            print(f"📦 Agent {agent_id} info received: {agent_info.get('hostname')}")
-        except asyncio.TimeoutError:
-            print(f"⏰ Timeout waiting for agent {agent_id} info")
-            await websocket.close(1008, "No agent info received")
-            return
-        except Exception as e:
-            print(f"❌ Error receiving agent info: {e}")
-            await websocket.close(1011, "Invalid agent info")
-            return
-        
-        # Store agent connection
-        await manager.connect_agent(agent_id, websocket, agent_info)
-        
-        # Handle bidirectional communication
-        async def receive_from_agent():
-            try:
-                async for message in websocket.iter_text():
-                    try:
-                        data = json.loads(message)
-                        
-                        # Route responses to web clients watching this agent
-                        if data.get("type") in ["command_output", "system_info", "process_list", "screen_frame", "process_killed"]:
-                            # Send to all web clients watching this agent
-                            if agent_id in manager.agent_clients:
-                                for client_id in manager.agent_clients[agent_id]:
-                                    if client_id in manager.active_web_clients:
-                                        try:
-                                            await manager.active_web_clients[client_id].send_text(json.dumps({
-                                                "type": "agent_response",
-                                                "agent_id": agent_id,
-                                                "data": data
-                                            }))
-                                        except Exception as e:
-                                            print(f"⚠️ Error sending to web client {client_id}: {e}")
-                                            # Remove dead connection
-                                            manager.disconnect_web_client(client_id)
-                    except json.JSONDecodeError:
-                        print(f"❌ Invalid JSON from agent {agent_id}")
-                    except Exception as e:
-                        print(f"❌ Error processing agent message: {e}")
-            except WebSocketDisconnect:
-                pass
-            except Exception as e:
-                print(f"❌ Error in receive_from_agent: {e}")
-            finally:
-                manager.disconnect_agent(agent_id)
-        
-        async def send_to_agent():
-            try:
-                while True:
-                    # Check for commands in queue
-                    if agent_id in manager.command_queues:
-                        try:
-                            command = await asyncio.wait_for(
-                                manager.command_queues[agent_id].get(), 
-                                timeout=1.0
-                            )
-                            await websocket.send_text(json.dumps(command))
-                            print(f"📤 Sent command to agent {agent_id}: {command.get('type')}")
-                        except asyncio.TimeoutError:
-                            await asyncio.sleep(0.1)
-                        except Exception as e:
-                            print(f"❌ Error sending command to agent: {e}")
-                    else:
-                        await asyncio.sleep(0.1)
-            except Exception as e:
-                print(f"❌ Error in send_to_agent: {e}")
-        
-        # Run both tasks
-        print(f"🔄 Starting message handlers for agent {agent_id}")
-        await asyncio.gather(receive_from_agent(), send_to_agent())
-        
-    except WebSocketDisconnect:
-        manager.disconnect_agent(agent_id)
-        print(f"🔌 Agent {agent_id} disconnected")
-    except Exception as e:
-        print(f"❌ Agent error: {e}")
-        manager.disconnect_agent(agent_id)
+def cleanup_sessions():
+    """Remove expired sessions"""
+    now = time.time()
+    expired = [t for t, s in user_sessions.items() if now > s["expires_at"]]
+    for t in expired:
+        del user_sessions[t]
 
-# Web Client WebSocket (browser)
-@app.websocket("/ws/client/{client_id}")
-async def client_websocket(websocket: WebSocket, client_id: str):
-    # Accept the connection
-    await websocket.accept()
-    print(f"🌐 Web client {client_id} attempting to connect...")
-    
-    # Connect the client
-    await manager.connect_web_client(client_id, websocket)
-    
-    try:
-        async for message in websocket.iter_text():
-            try:
-                data = json.loads(message)
-                print(f"📨 Received from web client {client_id}: {data.get('type')}")
-                
-                # Forward command to specific agent
-                agent_id = data.get("agent_id")
-                if agent_id:
-                    if agent_id in manager.active_agents:
-                        # Add this client to the agent's watch list
-                        manager.add_client_to_agent(agent_id, client_id)
-                        
-                        command = {
-                            "type": data.get("type"),
-                            "data": data.get("data", {}),
-                            "client_id": client_id,
-                            "timestamp": datetime.datetime.utcnow().isoformat()
-                        }
-                        
-                        # Queue command for agent
-                        if agent_id in manager.command_queues:
-                            await manager.command_queues[agent_id].put(command)
-                            
-                            # Acknowledge
-                            await websocket.send_text(json.dumps({
-                                "type": "command_queued",
-                                "agent_id": agent_id,
-                                "command": data.get("type")
-                            }))
-                            print(f"✅ Command queued for agent {agent_id}")
-                        else:
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": f"Agent {agent_id} command queue not found"
-                            }))
-                    else:
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": f"Agent {agent_id} not connected"
-                        }))
-                else:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "No agent_id provided"
-                    }))
-            except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "Invalid JSON"
-                }))
-            except Exception as e:
-                print(f"❌ Error processing client message: {e}")
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": str(e)
-                }))
-                
-    except WebSocketDisconnect:
-        manager.disconnect_web_client(client_id)
-        print(f"🌐 Web client {client_id} disconnected")
-    except Exception as e:
-        print(f"❌ Web client error: {e}")
-        manager.disconnect_web_client(client_id)
+# ==================== API ENDPOINTS ====================
+@app.get("/")
+async def root():
+    """Root endpoint - serves the web interface"""
+    with open("index.html", "r") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
 
-@app.get("/health")
-async def health_check():
+@app.get("/api/status")
+async def get_status():
+    """Get server status"""
     return {
-        "status": "healthy",
-        "agents": len(manager.active_agents),
-        "web_clients": len(manager.active_web_clients),
+        "online": True,
+        "agents": len(connected_agents),
+        "clients": len(connected_clients),
+        "timestamp": int(time.time()),
         "version": "1.0.0"
     }
 
-@app.get("/")
-async def root():
-    return {
-        "name": "Remote PC Control API",
-        "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "login": "/api/login",
-            "agents": "/api/agents",
-            "websocket_agent": "/ws/agent/{agent_id}",
-            "websocket_client": "/ws/client/{client_id}"
-        }
-    }
+@app.post("/api/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    """Login endpoint"""
+    # Find user
+    user = users.get(request.username)
+    if not user or user["password"] != request.password:
+        return LoginResponse(
+            success=False,
+            access_token=None,
+            is_admin=False,
+            message="Invalid username or password"
+        )
+    
+    # Create session
+    token = create_session(request.username, user["is_admin"])
+    
+    return LoginResponse(
+        success=True,
+        access_token=token,
+        is_admin=user["is_admin"],
+        message="Login successful"
+    )
 
+@app.get("/api/agents")
+async def get_agents(request: Request):
+    """Get list of connected agents"""
+    # Verify authentication
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    token = auth_header.replace("Bearer ", "")
+    session = verify_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    # Return agent list with info
+    agents = []
+    for agent_id, ws in connected_agents.items():
+        info = agent_info.get(agent_id, {})
+        agents.append({
+            "id": agent_id,
+            "connected": True,
+            "last_seen": time.time(),
+            **info
+        })
+    
+    return agents
+
+@app.post("/api/command")
+async def send_command(request: CommandRequest, req: Request):
+    """Send command to an agent"""
+    # Verify authentication
+    auth_header = req.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    token = auth_header.replace("Bearer ", "")
+    session = verify_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    # Check if agent exists
+    if request.agent_id not in connected_agents:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Queue command
+    ws = connected_agents[request.agent_id]
+    try:
+        await ws.send_json({
+            "type": request.type,
+            "data": request.data
+        })
+        return {"success": True, "message": "Command sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send command: {e}")
+
+# ==================== WEBSOCKET ENDPOINTS ====================
+@app.websocket("/ws/agent/{agent_id}")
+async def websocket_agent(websocket: WebSocket, agent_id: str):
+    """WebSocket endpoint for PC agents"""
+    await websocket.accept()
+    logger.info(f"✅ Agent connected: {agent_id}")
+    
+    connected_agents[agent_id] = websocket
+    
+    try:
+        while True:
+            # Receive message
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            # Handle different message types
+            msg_type = message.get("type")
+            
+            if msg_type == "system_info":
+                # Store agent info
+                agent_info[agent_id] = message.get("data", {})
+                logger.info(f"📊 Received system info from {agent_id}")
+                
+            elif msg_type in ["command_output", "screen_frame", "process_list"]:
+                # Forward to all connected clients
+                for client_id, client_ws in connected_clients.items():
+                    try:
+                        await client_ws.send_json({
+                            "type": "agent_response",
+                            "agent_id": agent_id,
+                            "data": message
+                        })
+                    except:
+                        pass
+                        
+            elif msg_type == "screen_frame":
+                # Update active screen status
+                if agent_id not in active_screens:
+                    active_screens.add(agent_id)
+                    
+                # Forward to clients
+                for client_id, client_ws in connected_clients.items():
+                    try:
+                        await client_ws.send_json({
+                            "type": "screen_frame",
+                            "agent_id": agent_id,
+                            "image": message.get("image"),
+                            "timestamp": message.get("timestamp")
+                        })
+                    except:
+                        pass
+                        
+            elif msg_type == "screen_stopped":
+                if agent_id in active_screens:
+                    active_screens.remove(agent_id)
+                    
+    except WebSocketDisconnect:
+        logger.info(f"🔌 Agent disconnected: {agent_id}")
+    except Exception as e:
+        logger.error(f"❌ Agent error {agent_id}: {e}")
+    finally:
+        # Cleanup
+        if agent_id in connected_agents:
+            del connected_agents[agent_id]
+        if agent_id in active_screens:
+            active_screens.remove(agent_id)
+
+@app.websocket("/ws/client/{client_id}")
+async def websocket_client(websocket: WebSocket, client_id: str):
+    """WebSocket endpoint for web clients"""
+    await websocket.accept()
+    logger.info(f"✅ Client connected: {client_id}")
+    
+    connected_clients[client_id] = websocket
+    
+    try:
+        while True:
+            # Receive command from client
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            cmd_type = message.get("type")
+            agent_id = message.get("agent_id")
+            cmd_data = message.get("data", {})
+            
+            logger.info(f"📨 Client {client_id} -> Agent {agent_id}: {cmd_type}")
+            
+            # Forward to agent if connected
+            if agent_id in connected_agents:
+                agent_ws = connected_agents[agent_id]
+                try:
+                    await agent_ws.send_json({
+                        "type": cmd_type,
+                        "data": cmd_data,
+                        "client_id": client_id
+                    })
+                    
+                    # Acknowledge to client
+                    await websocket.send_json({
+                        "type": "command_queued",
+                        "agent_id": agent_id,
+                        "command": cmd_type
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Failed to send to agent: {e}"
+                    })
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Agent {agent_id} not connected"
+                })
+                
+    except WebSocketDisconnect:
+        logger.info(f"🔌 Client disconnected: {client_id}")
+    except Exception as e:
+        logger.error(f"❌ Client error {client_id}: {e}")
+    finally:
+        if client_id in connected_clients:
+            del connected_clients[client_id]
+
+# ==================== BACKGROUND TASKS ====================
+@app.on_event("startup")
+async def startup_event():
+    """Startup tasks"""
+    logger.info("=" * 60)
+    logger.info("🚀 Remote PC Control Server Starting...")
+    logger.info(f"📡 WebSocket endpoint: ws://localhost:8000/ws/{{agent/client}}/{{id}}")
+    logger.info(f"👤 Admin user: {ADMIN_USERNAME}")
+    logger.info(f"🔑 API Key: {API_KEY}")
+    logger.info("=" * 60)
+    
+    # Start background task for cleanup
+    asyncio.create_task(cleanup_task())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown tasks"""
+    logger.info("🛑 Server shutting down...")
+
+async def cleanup_task():
+    """Periodic cleanup of expired sessions"""
+    while True:
+        await asyncio.sleep(300)  # Every 5 minutes
+        cleanup_sessions()
+        logger.debug(f"🧹 Cleaned up sessions. Active: {len(user_sessions)}")
+
+# ==================== RUN SERVER ====================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "backend:app",
+        host="0.0.0.0",
+        port=port,
+        reload=os.getenv("ENVIRONMENT") == "development"
+    )
