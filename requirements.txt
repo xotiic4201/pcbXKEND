@@ -1,12 +1,21 @@
+# requirements-backend.txt
 fastapi==0.104.1
-uvicorn==0.24.0
-websockets==12.0
-pyautogui==0.9.54
-psutil==5.9.6
-mss==9.0.1
-Pillow
+uvicorn[standard]==0.24.0
+websockets==11.0.3
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
-requests==2.31.0
-pyjwt==2.8.0  # Alternative JWT library
+redis==5.0.1
+aioredis==2.0.1
+prometheus-client==0.18.0
+psutil==5.9.5
+py-cpuinfo==9.0.0
+python-dotenv==1.0.0
+pydantic==2.4.2
+pyjwt==2.8.0
+cryptography==41.0.5
+httpx==0.25.1
+python-socketio==5.10.0
+aiofiles==23.2.1
+celery==5.3.4
+flower==2.0.0
