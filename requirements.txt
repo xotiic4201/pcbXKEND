@@ -18,7 +18,7 @@ redis==5.0.1
 # HTTP & Files
 httpx==0.25.1
 aiofiles==23.2.1
-
+pyjwt
 # Monitoring
 prometheus-client==0.18.0
 
