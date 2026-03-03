@@ -9,6 +9,7 @@ import asyncio
 import logging
 import uuid
 import hashlib
+import time  # <-- ADD THIS IMPORT
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 from collections import defaultdict
@@ -351,6 +352,7 @@ async def websocket_frontend(websocket: WebSocket):
 
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
+    agent_id = None  # Initialize agent_id to handle in except block
     try:
         # First message should be registration
         data = await websocket.receive_json()
@@ -414,18 +416,19 @@ async def websocket_agent(websocket: WebSocket):
                 logger.warning(f"Unknown message from agent {agent_id}: {msg_type}")
     
     except WebSocketDisconnect:
-        manager.disconnect_agent(agent_id)
-        
-        # Notify frontends
-        for frontend_id, frontend in manager.frontend_connections.items():
-            if frontend["authenticated"]:
-                await manager.send_to_frontend(frontend_id, {
-                    "type": "agent_disconnected",
-                    "agent_id": agent_id
-                })
+        if agent_id:
+            manager.disconnect_agent(agent_id)
+            
+            # Notify frontends
+            for frontend_id, frontend in manager.frontend_connections.items():
+                if frontend["authenticated"]:
+                    await manager.send_to_frontend(frontend_id, {
+                        "type": "agent_disconnected",
+                        "agent_id": agent_id
+                    })
     except Exception as e:
         logger.error(f"Agent error: {e}")
-        if 'agent_id' in locals():
+        if agent_id:
             manager.disconnect_agent(agent_id)
 
 if __name__ == "__main__":
