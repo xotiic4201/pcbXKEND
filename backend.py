@@ -9,7 +9,7 @@ import asyncio
 import logging
 import uuid
 import hashlib
-import time  # <-- ADD THIS IMPORT
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 from collections import defaultdict
@@ -47,7 +47,7 @@ security = HTTPBearer()
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pcfront.vercel.app"],  # In production, replace with specific origins
+    allow_origins=["https://pcfront.vercel.app"],  # Allow all origins for testing
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,6 +104,16 @@ class ConnectionManager:
             "assigned_frontends": set()
         }
         logger.info(f"Agent connected: {agent_id} ({agent_info.get('hostname')})")
+        
+        # Send confirmation immediately
+        try:
+            await websocket.send_json({
+                "type": "registered",
+                "agent_id": agent_id,
+                "status": "success"
+            })
+        except Exception as e:
+            logger.error(f"Error sending registration confirmation: {e}")
 
     def disconnect_agent(self, agent_id: str):
         if agent_id in self.agent_connections:
@@ -189,6 +199,17 @@ async def root():
         "timestamp": datetime.now().isoformat()
     }
 
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "connections": {
+            "frontend": len(manager.frontend_connections),
+            "agent": len(manager.agent_connections)
+        }
+    }
+
 @app.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest, x_forwarded_for: Optional[str] = None):
     client_ip = x_forwarded_for or "unknown"
@@ -224,17 +245,6 @@ async def login(request: LoginRequest, x_forwarded_for: Optional[str] = None):
 async def list_agents(token_data: dict = Depends(verify_token)):
     """List all connected agents"""
     return {"agents": manager.get_agent_list()}
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "connections": {
-            "frontend": len(manager.frontend_connections),
-            "agent": len(manager.agent_connections)
-        }
-    }
 
 # ==================== WebSocket Endpoints ====================
 @app.websocket("/ws/frontend")
@@ -352,16 +362,26 @@ async def websocket_frontend(websocket: WebSocket):
 
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket):
-    agent_id = None  # Initialize agent_id to handle in except block
+    agent_id = None
     try:
+        # Accept the connection immediately
+        await websocket.accept()
+        logger.info("Agent WebSocket connection accepted, waiting for registration...")
+        
         # First message should be registration
         data = await websocket.receive_json()
+        logger.info(f"Received agent registration: {data.get('type')}")
         
         if data.get("type") != "agent_register":
+            logger.error(f"Invalid registration type: {data.get('type')}")
             await websocket.close(code=1002, reason="Invalid registration")
             return
         
-        agent_id = data.get("agent_id", str(uuid.uuid4()))
+        agent_id = data.get("agent_id")
+        if not agent_id:
+            agent_id = str(uuid.uuid4())
+            logger.warning(f"No agent_id provided, generated: {agent_id}")
+        
         agent_info = {
             "hostname": data.get("hostname", "Unknown"),
             "platform": data.get("platform", "Unknown"),
@@ -370,12 +390,6 @@ async def websocket_agent(websocket: WebSocket):
         }
         
         await manager.connect_agent(websocket, agent_id, agent_info)
-        
-        # Send acknowledgment
-        await websocket.send_json({
-            "type": "registered",
-            "agent_id": agent_id
-        })
         
         # Notify all frontends
         for frontend_id, frontend in manager.frontend_connections.items():
@@ -390,6 +404,8 @@ async def websocket_agent(websocket: WebSocket):
                     }
                 })
         
+        logger.info(f"Agent {agent_id} fully registered and ready")
+        
         # Main message loop
         while True:
             data = await websocket.receive_json()
@@ -402,11 +418,12 @@ async def websocket_agent(websocket: WebSocket):
             # Handle different message types
             if msg_type in ["system_info", "video_frame", "screenshot", 
                            "command_output", "file_list", "file_chunk",
-                           "file_transfer_complete", "clipboard", "error"]:
+                           "file_transfer_complete", "clipboard", "error", "heartbeat"]:
                 
                 # Forward to assigned frontends
-                for frontend_id in manager.agent_connections[agent_id]["assigned_frontends"]:
-                    await manager.send_to_frontend(frontend_id, data)
+                if agent_id in manager.agent_connections:
+                    for frontend_id in manager.agent_connections[agent_id]["assigned_frontends"]:
+                        await manager.send_to_frontend(frontend_id, data)
             
             elif msg_type == "pong":
                 # Just update last_seen (already done above)
@@ -417,6 +434,7 @@ async def websocket_agent(websocket: WebSocket):
     
     except WebSocketDisconnect:
         if agent_id:
+            logger.info(f"Agent {agent_id} disconnected")
             manager.disconnect_agent(agent_id)
             
             # Notify frontends
@@ -433,4 +451,5 @@ async def websocket_agent(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
